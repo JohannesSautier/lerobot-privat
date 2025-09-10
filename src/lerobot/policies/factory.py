@@ -48,7 +48,7 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
 
         return DiffusionPolicy
     elif name == "ditflow":
-        from lerobot.common.policies.dit_flow.modeling_dit_flow import DiTFlowPolicy
+        from lerobot.policies.dit_flow.modeling_dit_flow import DiTFlowPolicy
 
         return DiTFlowPolicy
     elif name == "act":

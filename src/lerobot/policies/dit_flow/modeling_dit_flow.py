@@ -17,12 +17,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
-from lerobot.common.constants import OBS_ENV, OBS_ROBOT
-from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
-from lerobot.common.policies.dit_flow.configuration_dit_flow import DiTFlowConfig
-from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.utils import (
+from lerobot.constants import OBS_ENV_STATE, OBS_STATE, ACTION, OBS_IMAGES
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
+from lerobot.policies.dit_flow.configuration_dit_flow import DiTFlowConfig
+from lerobot.policies.normalize import Normalize, Unnormalize
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
     populate_queues,
@@ -337,6 +337,22 @@ class DiTFlowPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Predict a chunk of actions given environment observations."""
+        # stack n latest observations from the queue
+        for key in batch:
+            if key in self._queues:
+                batch[key] = torch.stack(list(self._queues[key]), dim=1)
+
+        # batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        actions = self.dit_flow.generate_actions(batch)
+
+        # TODO(rcadene): make above methods return output dictionary?
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        return actions
+
     @torch.no_grad
     def select_action(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Select a single action given environment observations.
@@ -362,26 +378,20 @@ class DiTFlowPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = torch.stack(
+            batch[OBS_IMAGES] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
         # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues["action"]) == 0:
-            # stack n latest observations from the queue
-            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            actions = self.dit_flow.generate_actions(batch)
+            actions = self.predict_action_chunk(batch)
+            self._queues[ACTION].extend(actions.transpose(0, 1))
 
-            # TODO(rcadene): make above methods return output dictionary?
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-
-            self._queues["action"].extend(actions.transpose(0, 1))
-
-        action = self._queues["action"].popleft()
+        action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
@@ -391,7 +401,7 @@ class DiTFlowPolicy(PreTrainedPolicy):
             )
         batch = self.normalize_targets(batch)
         loss = self.dit_flow.compute_loss(batch)
-        return {"loss": loss}
+        return loss, None
 
 
 class DiTFlowModel(nn.Module):
@@ -472,8 +482,8 @@ class DiTFlowModel(nn.Module):
 
     def _prepare_global_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
-        batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
-        global_cond_feats = [batch[OBS_ROBOT]]
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        global_cond_feats = [batch[OBS_STATE]]
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -503,7 +513,7 @@ class DiTFlowModel(nn.Module):
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
-            global_cond_feats.append(batch[OBS_ENV])
+            global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)

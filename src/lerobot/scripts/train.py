@@ -13,6 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# import os
+# print(">>> Running from:", os.path.abspath(__file__))
+# import debugpy
+# debugpy.listen(("0.0.0.0", 5678))
+# print("Waiting for debugger attach…")
+# debugpy.wait_for_client()   
+# print("Hello, Debugging!")
+
 import logging
 import time
 from contextlib import nullcontext
