@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+import threading
 
 from lerobot.constants import OBS_ENV_STATE, OBS_STATE, ACTION, OBS_IMAGES
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
@@ -306,6 +307,12 @@ class DiTFlowPolicy(PreTrainedPolicy):
         """
         super().__init__(config)
 
+        self._prefetch_thread = None
+        self._prefetch_stream = torch.cuda.Stream()
+        self._prefetch_ready = threading.Event()
+        self._prefetched_actions = None
+        self._run=0
+
         config.validate_features()
         self.config = config
 
@@ -353,6 +360,23 @@ class DiTFlowPolicy(PreTrainedPolicy):
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
 
         return actions
+    
+
+
+    def _start_prefetch(self, batch):
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            return
+        self._prefetch_ready.clear()
+
+        def _worker():
+            with torch.cuda.stream(self._prefetch_stream), torch.inference_mode():
+                actions = self.predict_action_chunk(batch)  
+            self._prefetch_stream.synchronize()
+            self._prefetched_actions = actions  
+            self._prefetch_ready.set()
+
+        self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
+        self._prefetch_thread.start()
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -360,17 +384,26 @@ class DiTFlowPolicy(PreTrainedPolicy):
 
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
-        # Note: It's important that this happens after stacking the images into a single key.
+            batch = dict(batch)
+            batch[OBS_IMAGES] = torch.stack([batch[k] for k in self.config.image_features], dim=-4)
         self._queues = populate_queues(self._queues, batch)
 
-        if len(self._queues["action"]) == 0:
-            actions = self.predict_action_chunk(batch)
-            self._queues[ACTION].extend(actions.transpose(0, 1))
+        # If no actions buffered 
+        if len(self._queues[ACTION]) == 0:
+            actions_now = self.predict_action_chunk(batch)          
+            self._queues[ACTION].extend(actions_now.transpose(0, 1))  
 
+        # Prefetch when four are left in the queue
+        if len(self._queues[ACTION]) == 4:
+            self._start_prefetch(batch)
+
+        # ---- CONSUME PREFETCHED RESULTS WHEN READY ----
+        if self._prefetch_ready.is_set():
+            self._prefetch_thread.join()
+            self._prefetch_thread = None
+            self._prefetch_ready.clear()
+            self._queues[ACTION].extend(self._prefetched_actions.transpose(0, 1)) 
+        # return next action
         action = self._queues[ACTION].popleft()
         return action
 
