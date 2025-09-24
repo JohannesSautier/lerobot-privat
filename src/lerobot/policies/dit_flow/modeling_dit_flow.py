@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
-from lerobot.constants import OBS_ENV_STATE, OBS_STATE, ACTION, OBS_IMAGES
+from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
 from lerobot.policies.dit_flow.configuration_dit_flow import DiTFlowConfig
 from lerobot.policies.normalize import Normalize, Unnormalize
@@ -356,7 +356,6 @@ class DiTFlowPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        
 
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
