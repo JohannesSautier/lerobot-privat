@@ -119,8 +119,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
     @property
     def robot_state_feature(self) -> PolicyFeature | None:
-        for _, ft in self.input_features.items():
-            if ft.type is FeatureType.STATE:
+        for key, ft in self.input_features.items():
+            if ft.type is FeatureType.STATE and key == "observation.state":
                 return ft
         return None
 

@@ -261,7 +261,8 @@ class _DiTNoiseNet(nn.Module):
 
     @torch.no_grad()
     def sample(
-        self, condition: torch.Tensor, timesteps: int = 100, generator: torch.Generator | None = None
+        self, condition: torch.Tensor, timesteps: int = 100, generator: torch.Generator | None = None, prefix: torch.Tensor | None = None,   # (B, lock_prefix, ac_dim)
+        lock_prefix: int = 0,
     ) -> torch.Tensor:
         # Use Euler integration to solve the ODE.
         batch_size, device = condition.shape[0], condition.device
@@ -271,9 +272,22 @@ class _DiTNoiseNet(nn.Module):
             torch.arange(timesteps, device=device).float().unsqueeze(0).expand(batch_size, timesteps)
             / timesteps
         )
+        # normalize prefix
+        if lock_prefix > 0 and prefix is not None:
+            if prefix.ndim == 2:  # allow (lock_prefix, A) for B=1
+                prefix = prefix.unsqueeze(0)
+            if prefix.shape[0] != batch_size:
+                prefix = prefix.expand(batch_size, -1, -1)
+            prefix = prefix.to(device)
+            # set once before loop
+            x_0[:, :lock_prefix, :] = prefix
+
 
         for k in range(timesteps):
             t = t_all[:, k]
+            # hard-clamp locked tokens every step to prevent drift
+            if lock_prefix > 0 and prefix is not None:
+                x_0[:, :lock_prefix, :] = prefix
             x_0 = x_0 + dt * self.forward(x_0, t, condition)
             if self.clip_sample:
                 x_0 = torch.clamp(x_0, -self.clip_sample_range, self.clip_sample_range)
@@ -345,6 +359,8 @@ class DiTFlowPolicy(PreTrainedPolicy):
         for key in batch:
             if key in self._queues:
                 batch[key] = torch.stack(list(self._queues[key]), dim=1)
+
+        self.dit_flow._inpainting_replan = int(getattr(self, "inpainting", 0) or 0)
 
         # batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         actions = self.dit_flow.generate_actions(batch)
@@ -441,6 +457,8 @@ class DiTFlowModel(nn.Module):
             self.noise_distribution = torch.distributions.TransformedDistribution(
                 beta_dist, [affine_transform]
             )
+        self._inpainting_replan: int = 0
+        self._prev_prefix: torch.Tensor | None = None
 
     # ========= inference  ============
     def conditional_sample(
@@ -456,9 +474,14 @@ class DiTFlowModel(nn.Module):
         if global_cond is not None:
             global_cond = global_cond.expand(batch_size, -1).to(device=device, dtype=dtype)
 
+        # compute lock size on the fly
+        n_action_steps = int(self.config.n_action_steps)
+        lock_prefix = max(0, n_action_steps - int(self._inpainting_replan))
+
         # Sample prior.
         sample = self.velocity_net.sample(
-            global_cond, timesteps=self.num_inference_steps, generator=generator
+            global_cond, timesteps=self.num_inference_steps, generator=generator, prefix=self._prev_prefix,
+            lock_prefix=lock_prefix,
         )
         return sample
 
@@ -524,6 +547,13 @@ class DiTFlowModel(nn.Module):
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+
+        n_action_steps = int(self.config.n_action_steps)
+        lock_prefix = max(0, n_action_steps - int(self._inpainting_replan))
+        if lock_prefix > 0:
+            self._prev_prefix = actions[:, :lock_prefix, :].detach()
+        else:
+            self._prev_prefix = None
 
         return actions
 
