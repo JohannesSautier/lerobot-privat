@@ -336,6 +336,10 @@ class DiTFlowPolicy(PreTrainedPolicy):
 
         self.dit_flow = DiTFlowModel(config)
 
+        self.inpainting: int = 0  
+
+        self.dit_flow._inpainting_replan = self.inpainting 
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -359,8 +363,6 @@ class DiTFlowPolicy(PreTrainedPolicy):
         for key in batch:
             if key in self._queues:
                 batch[key] = torch.stack(list(self._queues[key]), dim=1)
-
-        self.dit_flow._inpainting_replan = int(getattr(self, "inpainting", 0) or 0)
 
         # batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         actions = self.dit_flow.generate_actions(batch)
@@ -459,6 +461,7 @@ class DiTFlowModel(nn.Module):
             )
         self._inpainting_replan: int = 0
         self._prev_prefix: torch.Tensor | None = None
+        self.lock_size = max(0, int(config.n_action_steps) - self._inpainting_replan)
 
     # ========= inference  ============
     def conditional_sample(
@@ -474,14 +477,11 @@ class DiTFlowModel(nn.Module):
         if global_cond is not None:
             global_cond = global_cond.expand(batch_size, -1).to(device=device, dtype=dtype)
 
-        # compute lock size on the fly
-        n_action_steps = int(self.config.n_action_steps)
-        lock_prefix = max(0, n_action_steps - int(self._inpainting_replan))
 
         # Sample prior.
         sample = self.velocity_net.sample(
             global_cond, timesteps=self.num_inference_steps, generator=generator, prefix=self._prev_prefix,
-            lock_prefix=lock_prefix,
+            lock_prefix=self.lock_size,
         )
         return sample
 
@@ -547,11 +547,15 @@ class DiTFlowModel(nn.Module):
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
-
-        n_action_steps = int(self.config.n_action_steps)
-        lock_prefix = max(0, n_action_steps - int(self._inpainting_replan))
-        if lock_prefix > 0:
-            self._prev_prefix = actions[:, :lock_prefix, :].detach()
+        
+        # Possibly change this since we will use in the more upwards processe the full action chunk and throw away the first part of the 
+        # chunk since it has already been predicted earlier. 
+        # What we want to remember for the new prediction cycle when we call generate_actions is the last part of the actions that will be executed while 
+        # we call this function again. We can use this part as a prefix for the next prediction. 
+        # This is only relevant when we do inpainting.
+        # Isnt that in that case the previous code is wrong?
+        if self.lock_size > 0:
+            self._prev_prefix = actions[:, -self.lock_size:, :].detach()
         else:
             self._prev_prefix = None
 
